@@ -1,6 +1,6 @@
-fastapi
-uvicorn
-python-multipart
-google-cloud-aiplatform
-google-cloud-storage
-PyGithub
+fastapi>=0.103.2
+uvicorn>=0.23.2
+google-cloud-aiplatform>=1.42.1
+google-cloud-firestore>=2.11.1
+pydantic>=2.4.2
+python-dotenv

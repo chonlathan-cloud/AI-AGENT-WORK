@@ -1,57 +1,71 @@
-from fastapi import FastAPI, UploadFile, File
-import os
-from google.cloud import aiplatform
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from pydantic import BaseModel, Field
+from app.services.ai_engine import transcribe_and_generate_logic
+from app.services.db_manager import create_project_state, get_project_state
+import logging
 
-app = FastAPI()
+# Configure basic logging
+logging.basicConfig(level=logging.INFO)
 
-# Configuration
-PROJECT_ID = "ai-manee-son"
-LOCATION = "us-central1" # เพื่อใช้ Gemini 1.5 Pro/Flash ล่าสุด
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-
-# Define the Brain
-SYSTEM_INSTRUCTION = """
-Role: You are a "Business-Tech Strategic Partner" with expertise in Digital Marketing and End-to-End Software Architecture.
-Objective: Analyze audio/video transcripts from customer meetings to generate a comprehensive Business_logic.md based on the End-to-End principle.
-
-Analysis Framework:
-
-Market Value & Strategy: Identify the core business problem, target audience, and the "Why" behind the project (Marketing perspective).
-User Journey: Map the end-user interaction from start to finish.
-Backend Logic: Define the data flow, security requirements, and core business rules (The "Heart" of the system).
-Scalability: Suggest how this system will grow (Cloud Architect perspective).
-Output Requirement:
-
-Strictly follow the agentskills.io specification.
-Output must be structured for professional HLD, LLD, and TDD generation.
-Use professional yet business-friendly language.
-"""
-
-model = GenerativeModel(
-    "gemini-3.1-pro-preview", # ใช้ Model ขั้นสูงที่สุดเพื่อ Performance สูงสุดตามแผนของคุณ
-    system_instruction=[SYSTEM_INSTRUCTION]
+app = FastAPI(
+    title="Scaffolding AI Agent API",
+    description="API for ingesting audio and generating architectural maps via Vertex AI.",
+    version="1.0.0"
 )
 
-@app.post("/analyze-concept")
-async def analyze_concept(file: UploadFile = File(...)):
-    # 1. อ่านไฟล์ที่อัปโหลดมา (MP3, WAV, MP4)
-    content = await file.read()
+# Request Models (Pydantic validation)
+class GcsEvent(BaseModel):
+    bucket: str = Field(..., description="The name of the GCS bucket.")
+    name: str = Field(..., description="The name of the object in the bucket.")
+
+# Response Models
+class WebhookResponse(BaseModel):
+    message: str
+    gcs_uri: str
+
+async def process_audio_pipeline(gcs_uri: str):
+    """
+    The actual background pipeline that processes the audio.
+    It calls Vertex AI asynchronously and saves the state to Firestore.
+    """
+    try:
+        logging.info(f"Starting analysis for {gcs_uri}")
+        # 1. Transcribe and generate business logic
+        business_logic_md = await transcribe_and_generate_logic(gcs_uri)
+        
+        # 2. Save to database awaiting approval
+        project_id = create_project_state(gcs_uri, business_logic_md)
+        logging.info(f"Successfully processed project: {project_id}")
+        
+    except Exception as e:
+        logging.error(f"Error processing {gcs_uri}: {str(e)}")
+
+@app.post("/webhook/audio-ingested", response_model=WebhookResponse)
+async def audio_ingested_webhook(event: GcsEvent, background_tasks: BackgroundTasks):
+    """
+    Endpoint triggered by Eventarc when a new audio file is uploaded to GCS.
+    It immediately returns a 200 OK and processes the audio in the background.
+    """
+    gcs_uri = f"gs://{event.bucket}/{event.name}"
+    logging.info(f"Received new audio file: {gcs_uri}")
     
-    # 2. เตรียมข้อมูลส่งให้ Gemini
-    audio_part = Part.from_data(data=content, mime_type=file.content_type)
+    # Process in background to avoid Eventarc timeout
+    background_tasks.add_task(process_audio_pipeline, gcs_uri)
     
-    # 3. ให้ Gemini วิเคราะห์
-    prompt = "Analyze this concept from the customer meeting and generate the End-to-End Business Logic."
-    response = model.generate_content([audio_part, prompt])
-    
-    # 4. ส่งผลลัพธ์กลับ (ใน Phase 3 เราจะส่งตัวนี้เข้า GitHub)
-    return {
-        "filename": file.filename,
-        "business_logic": response.text
-    }
+    return WebhookResponse(message="Processing started", gcs_uri=gcs_uri)
+
+@app.get("/api/projects/{project_id}")
+async def review_business_logic(project_id: str):
+    """
+    Endpoint for Human-in-the-Loop review.
+    Retrieve the generated Business Logic for inspection in VSCode/Postman.
+    """
+    data = get_project_state(project_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return data
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # uvicorn.run(app, host="0.0.0.0", port=8000)
+    # The command to run should be: uvicorn app.main:app --reload
