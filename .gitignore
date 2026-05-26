@@ -1,0 +1,5 @@
+# 🚫 Ignore files for Gemini CLI and Git
+.venv/
+__pycache__/
+*.pyc
+.env
